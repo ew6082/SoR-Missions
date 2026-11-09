@@ -1,5 +1,5 @@
 print('====== SoR Missions =======')
-print('version 0.978' )
+print('version 0.979' )
 print('by nerp')
 print('=======================')
 
