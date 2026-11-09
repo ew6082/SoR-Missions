@@ -2,6 +2,7 @@ print('====== SoR Missions =======')
 print('version 0.979' )
 print('by nerp')
 print('=======================')
+print('/sorm for help')
 
 -- SoR Missions, the common core: state, group comms, mode/nav control, MA targeting, burn
 -- mode, the zone-in / start, commands, the window, and the main loop. Everything that
@@ -49,7 +50,6 @@ local MISSION_MODULES = { 'echo', 'wax', 'colossus', 'shardrahn' }
 local def  = {
     class = mq.TLO.Me.Class.ShortName(),
     name  = mq.TLO.Me.CleanName(),
-    MA = mq.TLO.Group.MainAssist(),
     DEBUG = false,
     pulse = 600,
     cmd   = "/sorm",
@@ -64,9 +64,7 @@ local flags = {
     DO_AURAS = true,       -- Colossus: tank drags each worker onto its aura (see check_auras)
     DODGE_STORMS = true,   -- Shar'Drahn: step out of '_storm' spawns (see check_storms)
     BURN_MODE = true,      -- Shar'Drahn/Colossus: burn at the trigger, then boss only (see BURN)
-    CURING = false,
     MA_MODE = false,
-    TANK = false,
     DOING_CIRCLE = false,
     HEAL_NORTH = true,   -- heal the Dark Flagellant; off for the achievement
     P2_FULLBURN = false, -- Echo of Hate: burn the Echo the moment we land in phase 2, no hold (crystals achievement)
@@ -143,10 +141,6 @@ end
 
 local function debug_local(str,...) if(def.DEBUG) then printf('DEBUG: '..str, ...) end end
 local function announce(str,...) if(flags.ANNO) then printf('\awSOR-Missions: \ag'..str, ...) end end
-function Core.debug_d(str,...) --global announce
-    if not def.DEBUG then return end
-    mq.cmdf((flags.USE_EQBC and '/bc SOR-Missions: ' or '/dgt \agSOR-Missions: ')..str, ...)
-end
 
 -- A player can target what is near, or anything on their XTarget window
 local function can_target(id)
@@ -1307,8 +1301,6 @@ local function Main()
             pick_target()
             BOXR_RG.close_in()   -- RGMercs MA only: walk in to a target out of reach
         end
-        flags.TANK = (mq.TLO.Group.MainTank() == def.name)
-
         mq.doevents()   -- always: the zone/task events are what set current_task
 
         if in_task then

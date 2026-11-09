@@ -300,7 +300,11 @@ function CO.start()
     mq.cmd("/nav locyxz -415 1825 1775 distance=10 log=off")
     mq.delay(500)
     while mq.TLO.Navigation.Active() do mq.delay(250) end
-    mq.cmd("/target npc Torm")
+    local torm = mq.TLO.Spawn("npc Torm")
+    if not (torm() and safe_target(torm.ID())) then
+        announce_g('Start: Torm not in reach -- start it by hand')
+        return
+    end
     mq.delay(500)
     mq.cmd("/say now")
     announce('Start: Colossus started')

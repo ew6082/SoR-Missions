@@ -76,7 +76,7 @@ end
 -- Manual; engage() puts SicTank back (State.self_held).
 local function leave_greedling()
     -- RGMercs would auto-target it straight back: ignore it for the session there
-    if Core.rgmercs_lua() and mq.TLO.Target.ID() then mq.cmdf("/rgl ignoretarget %d", mq.TLO.Target.ID()) end
+    if Core.rgmercs_lua() and (mq.TLO.Target.ID() or 0) > 0 then mq.cmdf("/rgl ignoretarget %d", mq.TLO.Target.ID()) end
     local echo = echo_boss()
     if echo then
         debug_local('leaving the greedling alone, swapping to the Echo')

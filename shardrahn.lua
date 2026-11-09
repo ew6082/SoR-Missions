@@ -96,11 +96,10 @@ local function do_dodge_storm(list)
     announce_g('Storm within %d and no clear ring spot -- move by hand', STORM.DANGER)
 end
 
-local function check_storms()
+local function check_storms(list)
     if State.current_task ~= M.TASK or not flags.DODGE_STORMS then return end
     if not Core.in_instance_zone() then return end
     if flags.DOING_CIRCLE or flags.DODGING then return end
-    local list = storms()
     if #list == 0 then return end
     local my, mx = mq.TLO.Me.Y(), mq.TLO.Me.X()
     if not (my and mx) then return end
@@ -204,12 +203,13 @@ end
 local storm_call = {}
 storm_call.assigned = 0
 storm_call.count = 0   -- Storm Calls up
+storm_call.storms = 0  -- '_storm' spawns up, counted per pulse for the UI
 
 local function circles_wanted()
     return State.current_task == M.TASK and not flags.BURN_MODE and storm_call.assigned >= 1
 end
 
-local function go_to_circle(num)
+local function go_to_circle()
     local spawn = mq.TLO.NearestSpawn('Storm Call')
     if not spawn() then
         announce_g('No aura spawns found')
@@ -231,7 +231,7 @@ local function go_to_circle(num)
             debug_local('Arrived at aura')
         end
         -- Re-issue nav if it dropped but we're still far
-        if not mq.TLO.Navigation.Active() or (spawn.Distance() > 20) then
+        if not mq.TLO.Navigation.Active() or ((spawn.Distance() or 0) > 20) then
             debug_local('Navigating to circle(distance)')
             mq.cmdf("/nav id %s facing=backwards distance=5 log=off",sid)
         end
@@ -253,7 +253,7 @@ local function go_to_circle(num)
     flags.DOING_CIRCLE = false
 end
 
-local function do_assigned_circle(num)
+local function do_assigned_circle()
     if storm_call.assigned < 1 then return end
     if flags.DOING_CIRCLE then return end
     local ok, err = pcall(go_to_circle)
@@ -273,7 +273,7 @@ local function shardrahn_storm()
     while (mq.TLO.SpawnCount("Storm Call")() or 0) < 1 and (mq.gettime() - started) < 5000 do
         mq.delay(100)
     end
-    do_assigned_circle(storm_call.assigned)
+    do_assigned_circle()
 end
 
 -- ============================================================
@@ -288,16 +288,18 @@ end
 M.hold = storm_hold
 
 function M.pulse()
-    check_storms()
+    local list = storms()
+    storm_call.storms = #list
+    check_storms(list)
     -- Storm Call circles: the emote is the trigger, this poll the fallback
-    storm_call.count = mq.TLO.SpawnCount("Storm Call")()
+    storm_call.count = mq.TLO.SpawnCount("Storm Call")() or 0
     -- Clear stuck DOING_CIRCLE flag if no circles remain
     if flags.DOING_CIRCLE and storm_call.count < 1 then
         debug_local('No circles up, clearing stuck DOING_CIRCLE flag')
         flags.DOING_CIRCLE = false
     end
     if circles_wanted() and (storm_call.count >= 1) and not flags.DOING_CIRCLE then
-        do_assigned_circle(storm_call.assigned)
+        do_assigned_circle()
     end
 end
 
@@ -309,7 +311,11 @@ function M.start()
     mq.cmd("/nav spawn gwark")
     mq.delay(500)
     while mq.TLO.Navigation.Active() do mq.delay(250) end
-    mq.cmd("/tar npc gwark")
+    local gwark = mq.TLO.Spawn("npc gwark")
+    if not (gwark() and Core.safe_target(gwark.ID())) then
+        announce_g('Start: Gwark not in reach -- start it by hand')
+        return
+    end
     mq.delay(500)
     mq.cmd("/say insist")
     announce("Start: Shar'Drahn started")
@@ -328,7 +334,7 @@ M.commands = {
     circle = function(value)
         if value == 'now' then
             storm_call.assigned = math.max(storm_call.assigned, 1)   -- run the nearest Storm Call now
-            do_assigned_circle(storm_call.assigned)
+            do_assigned_circle()
         else
             storm_call.assigned = Core.bool_arg(value, storm_call.assigned >= 1) and 1 or 0
             printf('Storm Call circles: %s', storm_call.assigned >= 1 and 'on' or 'off')
@@ -366,7 +372,7 @@ function M.ui()
     ImGui.SameLine()
     flags.DODGE_STORMS = Core.toggle_button('dodge', flags.DODGE_STORMS)
     ImGui.SameLine()
-    ImGui.TextDisabled(string.format('(%d up)', #storms()))
+    ImGui.TextDisabled(string.format('(%d up)', storm_call.storms))
     Core.status_flag('Storm Call circles:', storm_call.assigned >= 1)
     ImGui.SameLine()
     local on = Core.toggle_button('circle', storm_call.assigned >= 1)

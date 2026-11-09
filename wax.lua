@@ -29,7 +29,6 @@ kill_order[W.TASK] = {"Waxwork_Lancer","Waxwork_Igniter","Waxwork_Trapper","Waxw
 -- margin left the group well behind.
 local wax_st = {}
 wax_st.SPREAD = 8     -- target spread, shown in the UI
-wax_st.PULSE  = 250   -- ms main-loop delay while balancing
 wax_st.spread = nil   -- current HP spread across the adds, for the UI (nil: not balancing)
 wax_st.wave_max = 0   -- most adds seen live at once this wave
 wax_st.finishing = false
@@ -342,7 +341,11 @@ end
 -- Abolishion, the walk stops and kills anything on the hate list that is not him.
 function W.start()
     Core.start_nav_clearing('abolishion')
-    mq.cmd("/target Abolishion")
+    local abo = mq.TLO.Spawn("npc Abolishion")
+    if not (abo() and Core.safe_target(abo.ID())) then
+        announce_g('Start: the Abolishion is not in reach -- start it by hand')
+        return
+    end
     mq.delay(500)
     mq.cmd("/say destroy")
     announce('Start: Waxwork Abolishion started')
