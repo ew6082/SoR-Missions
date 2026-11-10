@@ -189,16 +189,12 @@ local function announce_g(str, ...)
     if not flags.ANNO then return end
     local msg = string.format(str, ...)
     printf('\awSOR-Missions: \ar%s', msg)
-    -- Colours go out as plain text (backslash-a), which /echo turns into colour on arrival:
     -- a raw \a is a BEL byte, and the EQBC server console beeps on every one it prints.
     bcge_np("/echo \\awSOR-Missions [%s]: \\ar%s", def.name, (msg:gsub('\a', '\\a')))
 end
 
 local function check_eqbc_default()
     flags.USE_EQBC = eqbc_has_group()
-    -- The MA pushes it: each toon's own check can disagree (a remote box sees EQBC
-    -- differently, or runs an older copy without this check) and sit on DanNet, which never
-    -- reaches us. MA only -- every toon pushing to every other was a wall of spam.
     if flags.USE_EQBC and mq.TLO.Group.MainAssist() == def.name then bcge("%s set_use_eqbc on", def.cmd) end
     printf('Group broadcasts: %s (%s)', flags.USE_EQBC and 'EQBC' or 'DanNet',
         flags.USE_EQBC and 'whole group is on EQBC' or 'not all of the group is on EQBC')
@@ -232,7 +228,6 @@ function Core.is_healer()
 end
 
 -- Nav options for a move: walk backward while anything is on our hate list, so we keep
--- facing what is following us instead of turning our back on it.
 function Core.tow_nav_opts()
     for i = 1, 20 do
         local xt = mq.TLO.Me.XTarget(i)
@@ -262,7 +257,7 @@ local function isclass_plugin_loaded()
 end
 
 -- Pause the class plugin / macro / helper luas. An already-paused plugin is not sent
--- "pause on" again (CWTN's bard plugin stops the current song on every one).
+-- "pause on" again (CWTN's bard plugin stops the current song on a delay each pause).
 local function pause()
     local ok, was_paused = pcall(function() return mq.TLO.CWTN.Paused() end)
     was_paused = ok and was_paused
@@ -852,9 +847,7 @@ local function target_for_ready(id)
     return false
 end
 
--- After we land, anyone still outside missed the first ready (said it too early, or was
--- out of earshot). Re-send target + ready to each straggler, nav-ing them to the giver
--- first, until the group is all here or GROUP_WAIT runs out. Holds the start meanwhile.
+-- Re-send target + ready to each straggler
 START.GROUP_WAIT  = 60   -- s
 START.RESEND_EVERY = 30  -- s
 START.UNPAUSE_AFTER = 5  -- s after the whole party is in: the last one in may still be loading
@@ -919,8 +912,7 @@ local function start_group_catchup()
     end
     -- Unpause only once the whole party is in the zone, then all at once. A toon's spawn
     -- shows here as soon as the server places it, while its client is still loading, and
-    -- a pause off sent then is lost (seen live 2026-11-01: the whole group stayed paused
-    -- into the Shar'Drahn fight).
+    -- a pause off sent then is lost 
     local t0, sent, due = mq.gettime(), nil, {}   -- due: name -> when to send its target + ready
     while (mq.gettime() - t0) < START.GROUP_WAIT * 1000 do
         local list = missing()
@@ -949,15 +941,13 @@ local function start_group_catchup()
         end
         mq.delay(1000)
     end
-    -- Starting without them was seen live: the MA pulled with a toon left outside.
     announce_g('Start: %s still outside after %ds -- NOT starting, %s start again once all are in',
         table.concat(missing(), ', '), START.GROUP_WAIT, def.cmd)
     start_group_unpause()   -- don't leave anyone paused, in here or out there
     return false
 end
 
--- A mission's start can walk to its NPC through trash: stop and kill anything on the
--- hate list that is not `spawn_name`, then carry on. Returns false if given up on.
+-- On Start, stop and kill xtarget trash while moving in. Return false if given up on.
 START.CLEAR_MAX = 120   -- s cap on one stop
 function Core.start_nav_clearing(spawn_name)
     local function hater()
@@ -1019,7 +1009,6 @@ local function run_start()
             mq.delay(START.SPAWN_SETTLE * 1000)
         end
         start_event()
-        -- the start walked us in: a SicTank MA camps here, not back at the door
         local mode = get_cwtn_mode() or ''
         if mq.TLO.Group.MainAssist() == def.name and (mode:find('Sic') or mode == 'Camp') then
             cwtn("resetcamp")
@@ -1139,7 +1128,6 @@ function Core.status_flag(label, on)
 end
 
 -- One button that flips a flag; the label is the action a click performs, and '###id'
--- keeps the ImGui id stable while it changes. Returns the (possibly flipped) value.
 function Core.toggle_button(id, value, off_label, on_label)
     if ImGui.Button((value and (on_label or 'Disable') or (off_label or 'Enable'))..'###'..id) then
         value = not value
@@ -1266,9 +1254,7 @@ local function Main()
     local function pulse()
         State.current_task = read_task()
         local m = mission()
-        -- Boss death from the task, not the spawn: the Abolishion despawns every wave, but
-        -- the step only moves on from "Defeat (the) <boss>" once he is dead. A step that
-        -- goes empty (task dropped) is not a kill.
+        -- Boss death from the task, not the spawn: the Abolishion despawns every wave.
         local step = State.current_task ~= 'None' and mq.TLO.Task(1).Step() or nil
         if step and step ~= '' and step ~= was_step then
             local boss = was_step and was_step:match('^Defeat (.+)$')
