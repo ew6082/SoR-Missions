@@ -1,5 +1,5 @@
 print('====== SoR Missions =======')
-print('version 0.979' )
+print('version 0.980' )
 print('by nerp')
 print('=======================')
 print('/sorm for help')
@@ -22,6 +22,8 @@ print('/sorm for help')
 --   can_start()   false refuses the start (it says why)
 --   start()       inside the mission: start the event
 --   commands      { key = function(value, args) } for /sorm <key> [value]
+--   sync()        list of '<key> <value>' commands: the MA's group-wide settings, pushed
+--                 to the group on a start
 --   usage(cmd)    print the mission's /sorm lines
 --   ui()          the mission's section of the window
 --   own_kill_announce  true: the mission announces its own boss kill
@@ -54,6 +56,9 @@ local def  = {
     pulse = 600,
     cmd   = "/sorm",
     TARGET_RANGE = 200,   -- safe_target: farther than this only if on xtarget
+    ENGAGE_MAX = 400,       -- xt_sane: a hater farther than this (3D) is not engaged
+    ENGAGE_NEAR = 100,      -- xt_sane: past this, the nav path is checked too
+    ENGAGE_PATH_MAX = 600,  -- xt_sane: a longer nav path (or none) is not engaged
 }
 
 local flags = {
@@ -96,6 +101,11 @@ Core.def, Core.flags, Core.kill_order, Core.state, Core.missions = def, flags, k
 local function mission() return missions[State.current_task] end
 Core.mission = mission
 
+-- Command work that blocks (navs, waits): the bind only queues it and the main loop runs
+-- it, so the bind returns at once.
+local deferred = {}
+function Core.defer(fn) deferred[#deferred + 1] = fn end
+
 -- ============================================================
 -- Comms and small helpers
 -- ============================================================
@@ -131,9 +141,14 @@ function Core.reachable_names()
     return set
 end
 
--- The shared task (mission) only: Type 'Shared'. Plain quests read 'Quest', and without a
--- mission Task(1) is the first of those.
+-- The shared task (mission) only: Type 'Shared'. Plain quests read 'Quest'. One of our
+-- missions is looked up by its title; any other shared task is read from Task(1) (the
+-- shared task when there is one), so it shows as "not one of ours".
 local function read_task()
+    for title in pairs(missions) do
+        local t = mq.TLO.Task(title)
+        if t() and t.Title() == title and t.Type() == 'Shared' then return title end
+    end
     if mq.TLO.Task(1).Type() ~= 'Shared' then return 'None' end
     local t = mq.TLO.Task(1).Title()
     return (t and t ~= '' and t ~= 'NULL') and t or 'None'
@@ -180,9 +195,19 @@ local function bct_send(noparse, name, fmt, ...)
 end
 local function bct(name, fmt, ...) bct_send(false, name, fmt, ...) end
 local function bct_np(name, fmt, ...) bct_send(true, name, fmt, ...) end
+-- Quiet versions for chatter nobody needs to read (ping/pong): /squelch on our side. The
+-- receiver's EQBC still prints its '# CMD' line unless that toon has /bccmd set silentcmd
+-- on (this EQBC server has no silent /bcsg, /bcst).
+local function bcge_q(fmt, ...) mq.cmdf('/squelch '..(flags.USE_EQBC and '/bcg /' or '/dgge ')..fmt, ...) end
+local function bct_q(name, fmt, ...) mq.cmdf('/squelch '..(flags.USE_EQBC and '/bct %s /' or '/dex %s ')..fmt, name, ...) end
 -- safe_target for another toon: the receiver checks its own distance. Send with a _np
 -- sender, args (id, def.TARGET_RANGE, id).
 local TARGET_IF_NEAR = "/if (${SpawnCount[id %d radius %d]}) /target id %d"
+-- Zone-in pushes: the receiver checks it is in game and not zoning before running them,
+-- and drops them if it is. Send with a _np sender.
+local INGAME = "${EverQuest.GameState.Equal[INGAME]} && !${Me.Zoning}"
+local IF_INGAME = "/if (" .. INGAME .. ") "
+local TARGET_IF_NEAR_INGAME = "/if (" .. INGAME .. " && ${SpawnCount[id %d radius %d]}) /target id %d"
 
 -- announce, plus an /echo on the rest of the group (not the whole DanNet/EQBC network)
 local function announce_g(str, ...)
@@ -208,12 +233,17 @@ local function bool_arg(value, current)
     else return not current end
 end
 
-local function squelch(pat,...) mq.cmdf("/squelch %s", string.format(pat,...) ) end
+local function squelch(pat,...) mq.cmdf("/squelch "..pat, ...) end
 
+-- 2D distance from us to y, x
 local function dist2d(y, x)
-    local my, mx = mq.TLO.Me.Y(), mq.TLO.Me.X()
-    if not (my and mx) then return math.huge end
-    return math.sqrt((my - y)^2 + (mx - x)^2)
+    if not (y and x) then return math.huge end
+    return mq.TLO.Math.Distance(y..','..x)() or math.huge
+end
+
+-- 2D distance between two points
+function Core.dist_yx(y1, x1, y2, x2)
+    return mq.TLO.Math.Distance(y1..','..x1..':'..y2..','..x2)() or math.huge
 end
 
 -- Mission/raid instance by short name. Not Me.Instance: guild halls are instanced too and
@@ -238,9 +268,49 @@ function Core.tow_nav_opts()
     return 'log=off'
 end
 
+-- Sanity check on a hater before engaging it. A spawn can warp: one landed on Shar'Drahn,
+-- aggroed, then warped back to its spawn point, and the MA navved across the zone after
+-- it. Gone, dead, too far, or no reasonable nav path: false (announced once per spawn).
+-- The mission's own mobs (kill order, burn boss) skip the range checks: Shar'Drahn is
+-- 430 from Gwark at the start. Only stray haters can be warp bugs.
+local xt_warned = {}
+local function mission_mob(s)
+    local name = (s.Name() or ''):lower()
+    for _, n in ipairs(kill_order[State.current_task] or {}) do
+        if name:find(n:lower(), 1, true) then return true end
+    end
+    local boss = Core.BURN and Core.BURN.boss[State.current_task]
+    return boss ~= nil and (s.CleanName() or ''):lower():find(boss:lower(), 1, true) ~= nil
+end
+local function xt_sane(id)
+    local s = mq.TLO.Spawn(id or 0)
+    if not s() or s.Dead() then return false end
+    if mission_mob(s) then return true end
+    local d = s.Distance3D() or math.huge
+    local why
+    if d > def.ENGAGE_MAX then
+        why = string.format('%.0f away', d)
+    elseif d > def.ENGAGE_NEAR then
+        local len = mq.TLO.Navigation.PathLength('id '..id)() or -1
+        if len < 0 then why = 'no nav path'
+        elseif len > def.ENGAGE_PATH_MAX then why = string.format('%.0f away by nav', len) end
+    end
+    if not why then
+        xt_warned[id] = nil
+        return true
+    end
+    if not xt_warned[id] then
+        xt_warned[id] = true
+        announce_g('Not engaging %s (%d): %s -- warped or bugged?', tostring(s.CleanName()), id, why)
+    end
+    return false
+end
+Core.xt_sane = xt_sane
+
 Core.read_task, Core.debug_local, Core.announce, Core.announce_g = read_task, debug_local, announce, announce_g
 Core.can_target, Core.safe_target = can_target, safe_target
 Core.bcg, Core.bcge, Core.bcg_np, Core.bcge_np, Core.bct, Core.bct_np = bcg, bcge, bcg_np, bcge_np, bct, bct_np
+Core.bcge_q, Core.bct_q = bcge_q, bct_q
 Core.TARGET_IF_NEAR = TARGET_IF_NEAR
 Core.bool_arg, Core.squelch, Core.dist2d, Core.in_instance_zone = bool_arg, squelch, dist2d, in_instance_zone
 
@@ -248,12 +318,14 @@ Core.bool_arg, Core.squelch, Core.dist2d, Core.in_instance_zone = bool_arg, sque
 -- Pause / resume and navigation
 -- ============================================================
 
+-- CWTN class plugin by class short name
+local CWTN_PLUGIN = { BER='mq2berzerker', BRD='mq2bard', BST='mq2bst', CLR='mq2cleric', DRU='mq2druid',
+    ENC='mq2enchanter', MAG='mq2mage', MNK='mq2monk', NEC='mq2necro', PAL='mq2paladin', RNG='mq2ranger',
+    ROG='mq2rogue', SHD='mq2eskay', SHM='mq2shaman', WAR='mq2war', WIZ='mq2wizard'
+}
+
 local function isclass_plugin_loaded()
-    local cPlugin = { BER='mq2berzerker', BRD='mq2bard', BST='mq2bst', CLR='mq2cleric', DRU='mq2druid',
-        ENC='mq2enchanter', MAG='mq2mage', MNK='mq2monk', NEC='mq2necro', PAL='mq2paladin', RNG='mq2ranger',
-        ROG='mq2rogue', SHD='mq2eskay', SHM='mq2shaman', WAR='mq2war', WIZ='mq2wizard'
-    }
-    return mq.TLO.Plugin(cPlugin[mq.TLO.Me.Class.ShortName()]).IsLoaded()
+    return mq.TLO.Plugin(CWTN_PLUGIN[mq.TLO.Me.Class.ShortName()]).IsLoaded()
 end
 
 -- Pause the class plugin / macro / helper luas. An already-paused plugin is not sent
@@ -334,12 +406,13 @@ local function nav_to_loc(y, x, z, nav_opts)
     return false
 end
 
--- Wait for a nav we just sent: up to 1s for it to start, then up to 30s for it to end.
-function Core.wait_nav()
+-- Wait for a nav we just sent: up to 1s for it to start, then up to max_s (default 30s)
+-- for it to end.
+function Core.wait_nav(max_s)
     local t = mq.gettime()
     while not mq.TLO.Navigation.Active() and (mq.gettime() - t) < 1000 do mq.delay(50) end
     t = mq.gettime()
-    while mq.TLO.Navigation.Active() and (mq.gettime() - t) < 30000 do mq.delay(100) end
+    while mq.TLO.Navigation.Active() and (mq.gettime() - t) < (max_s or 30) * 1000 do mq.delay(100) end
 end
 
 -- Selo's (bard run speed) slides us past nav stops. Strip it before a nav that has to
@@ -391,8 +464,8 @@ local boxr_skipped = {}   -- CWTN-only commands already reported as skipped
 Core.MODE_NUM = { Assist=1, Camp=1, Chase=2, ChaseAssist=2, Vorpal=3, VorpalAssist=3, Tank=4, PullerTank=5, PullerAssist=6, SicTank=7, HunterTank=8 }
 
 -- RGMercs Lua edition, driving this character instead of a CWTN plugin. It has commands
--- Boxr does not use (read from /rgl help, RGMercs 2.3.2): burnnow, which Boxr reports as
--- unsupported for the Lua edition; forcetarget, so an RGMercs MA fights what we pick
+-- Boxr does not use (read from /rgl help, RGMercs 2.3.2): burnnow, a one-off burn (Boxr's
+-- BurnNow sets BurnAlways 1 instead); forcetarget, so an RGMercs MA fights what we pick
 -- instead of its own auto-target; ignoretarget; and backoff, to stop engaging entirely.
 local function rgmercs_lua()
     return not isclass_plugin_loaded() and mq.TLO.Lua.Script('rgmercs').Status() == 'RUNNING'
@@ -429,6 +502,20 @@ local function cwtn(cmd)
     else boxr_cmd(cmd) end
 end
 
+-- Mode / pause on another toon, which may or may not run sorm. The receiver picks: its
+-- CWTN class plugin if loaded (the exact CWTN command), else MQ2Boxr's form of it.
+-- delay: tenths of a second, sent as /timed.
+-- ingame: only if the receiver is in game and not zoning (zone-in pushes).
+local function bct_mode(name, cls, cwtn_cmd, boxr_cmd, delay, ingame)
+    local plugin = CWTN_PLUGIN[cls or '']
+    local cmd = plugin
+        and string.format("/docommand ${If[${Plugin[%s].IsLoaded},/%s %s,/boxr %s]}", plugin, cls:lower(), cwtn_cmd, boxr_cmd)
+        or "/boxr "..boxr_cmd
+    if delay then cmd = "/timed "..delay.." "..cmd end
+    if ingame then cmd = IF_INGAME..cmd end
+    bct_np(name, "%s", cmd)
+end
+
 -- Mode name: CWTN's own, or under MQ2Boxr the last one set (Manual / Camp / Chase)
 local function get_cwtn_mode()
     if not isclass_plugin_loaded() then return boxr_mode end
@@ -441,7 +528,7 @@ end
 local function set_mode(m)
     local key = m and (tostring(m):gsub(' ', ''))
     local n = key and Core.MODE_NUM[key]
-    if n then cwtn(string.format("mode %d", n))
+    if n then cwtn("mode "..n)
     elseif key and key ~= 'Manual' and key ~= 'none' then
         announce_g('Cannot restore CWTN mode "%s" -- unknown name, still in Manual', key)
     end
@@ -465,24 +552,30 @@ function Core.rgmercs_backoff(on)
     if rgmercs_lua() then mq.cmdf("/rgl backoff %s", on and 'on' or 'off') end
 end
 
--- Without a CWTN plugin for our class, MQ2Boxr is required: load it if it is not.
-local function ensure_mode_control()
-    if isclass_plugin_loaded() then return true end
-    if not mq.TLO.Plugin('mq2boxr').IsLoaded() then
-        print('No CWTN plugin for '..tostring(def.class)..' -- loading MQ2Boxr for mode control')
-        mq.cmd("/plugin mq2boxr")
-        mq.delay(2000, function() return mq.TLO.Plugin('mq2boxr').IsLoaded() end)
+-- Required plugins, checked once at startup: MQ2Nav, DanNet or EQBC for the group, and a
+-- CWTN class plugin or MQ2Boxr for mode control. Lists what is missing; false if anything is.
+local function check_plugins()
+    local missing = {}
+    if not mq.TLO.Plugin('mq2nav').IsLoaded() then
+        missing[#missing + 1] = 'MQ2Nav (/plugin mq2nav)'
     end
-    if not mq.TLO.Plugin('mq2boxr').IsLoaded() then
-        print('\arMQ2Boxr could not be loaded: mode changes and burns will not work')
-        return false
+    if not mq.TLO.Plugin('mq2dannet').IsLoaded() and not mq.TLO.Plugin('mq2eqbc').IsLoaded() then
+        missing[#missing + 1] = 'MQ2DanNet or MQ2EQBC (/plugin mq2dannet)'
     end
-    print('Mode control: MQ2Boxr (Manual / Camp / Chase)')
-    return true
+    if not isclass_plugin_loaded() and not mq.TLO.Plugin('mq2boxr').IsLoaded() then
+        missing[#missing + 1] = string.format('a CWTN plugin for %s, or MQ2Boxr (/plugin mq2boxr)', tostring(def.class))
+    end
+    if #missing == 0 then
+        if not isclass_plugin_loaded() then print('Mode control: MQ2Boxr (Manual / Camp / Chase)') end
+        return true
+    end
+    print('\arSoR Missions needs these plugins loaded:')
+    for _, p in ipairs(missing) do print('\ar  - '..p) end
+    return false
 end
 
 Core.rgmercs_lua, Core.cwtn, Core.get_cwtn_mode, Core.set_mode = rgmercs_lua, cwtn, get_cwtn_mode, set_mode
-Core.fight_mode, Core.ma_target = fight_mode, ma_target
+Core.fight_mode, Core.ma_target, Core.bct_mode = fight_mode, ma_target, bct_mode
 
 -- ============================================================
 -- MA targeting: the hate list in the mission's kill order
@@ -515,7 +608,8 @@ local function radar()
         local xt = mq.TLO.Me.XTarget(i)
         local xtid = tonumber(xt.ID())
         if xtid and xtid ~= 0 and xt.TargetType() == 'Auto Hater' and xt.Type() == 'NPC' and xt.Master() == nil
-                and not (xt.CleanName() or ''):find('corpse', 1, true) then   -- fresh corpse can read NPC
+                and not (xt.CleanName() or ''):find('corpse', 1, true)   -- fresh corpse can read NPC
+                and xt_sane(xtid) then
             table.insert(xtars, xtid)
         end
     end
@@ -555,6 +649,10 @@ function BOXR_RG.close_in()
 end
 
 local function engage(targid, priority)
+    if not xt_sane(targid) then
+        if State.assigned_target == targid then State.assigned_target = nil end
+        return
+    end
     State.assigned_target = targid
     State.current_target_priority = priority
     if not mq.TLO.Spawn(targid)() then return end
@@ -750,8 +848,8 @@ local function start_group_pause(on, only)
     for i = 1, (mq.TLO.Group.Members() or 0) do
         local m = mq.TLO.Group.Member(i)
         local name, cls = m.Name(), m.Class.ShortName()
-        if name and cls and (not only or only[name]) then
-            bct(name, "/%s pause %s", cls:lower(), on and 'on' or 'off')
+        if name and cls and not m.Mercenary() and (not only or only[name]) then
+            bct_mode(name, cls, on and 'pause on' or 'pause off', on and 'pause' or 'unpause', nil, true)
         end
     end
 end
@@ -774,42 +872,74 @@ local function start_group_tank()
     return nil
 end
 
--- Before the hail: everyone visible, the tank made MT + MA if it is not already, the MA
--- in SicTank (not Vorpal) and the rest in Chase. noauto, so the plugins' own auto mode switching
--- leaves them there. Roles can only be set by the group leader: sent to it if not us.
-local function start_group_setup()
+-- The tank made MT + MA if it is not already. Roles can only be set by the group leader:
+-- sent to it if not us. False if there is no tank or the roles did not take.
+local function start_group_roles()
     local tank = start_group_tank()
     if not tank then
-        announce_g('Start: no tank class in the group -- roles left as they are')
-    else
-        local leader = mq.TLO.Group.Leader()
-        local function role(n)
-            if leader == def.name then mq.cmdf("/grouproles set %s %d", tank, n)
-            elseif leader then bct(leader, "/grouproles set %s %d", tank, n) end
-        end
-        if mq.TLO.Group.MainTank() ~= tank then role(1) end
-        if mq.TLO.Group.MainAssist() ~= tank then role(2) end
-        mq.delay(2000, function()
-            return mq.TLO.Group.MainTank() == tank and mq.TLO.Group.MainAssist() == tank
-        end)
-        if mq.TLO.Group.MainAssist() ~= tank then
-            announce_g('Start: could not make %s MT/MA (leader %s) -- set the roles by hand', tank, tostring(leader))
-        else
-            announce('Start: %s is MT and MA', tank)
-        end
+        announce_g('Start: no tank class in the group -- set MT/MA by hand, then start again')
+        return false
     end
+    local leader = mq.TLO.Group.Leader()
+    local function role(n)
+        if leader == def.name then mq.cmdf("/grouproles set %s %d", tank, n)
+        elseif leader then bct(leader, "/grouproles set %s %d", tank, n) end
+    end
+    if mq.TLO.Group.MainTank() ~= tank then role(1) end
+    if mq.TLO.Group.MainAssist() ~= tank then role(2) end
+    mq.delay(2000, function()
+        return mq.TLO.Group.MainTank() == tank and mq.TLO.Group.MainAssist() == tank
+    end)
+    if mq.TLO.Group.MainAssist() ~= tank then
+        announce_g('Start: could not make %s MT/MA (leader %s) -- set the roles by hand', tank, tostring(leader))
+        return false
+    end
+    announce('Start: %s is MT and MA', tank)
+    return true
+end
+
+-- Group check before a start: grouped, and every member online, in the zone with us and
+-- alive -- outside, also gathered at the giver (within START.GATHER of us). Lists what
+-- is wrong; false if anything is.
+START.GATHER = 150
+START.ZONEIN_VALID = 300   -- s a start's zone-in mark lasts (event_zoned)
+local function start_validate(outside)
+    local n = mq.TLO.Group.Members() or 0
+    if n == 0 then
+        announce_g('Start: not in a group')
+        return false
+    end
+    local bad = {}
+    for i = 1, n do
+        local m = mq.TLO.Group.Member(i)
+        local name = m.Name() or ('member '..i)
+        local d = m.Spawn.Distance() or math.huge
+        if m.Offline() then bad[#bad + 1] = name..' offline'
+        elseif m.OtherZone() or (m.Spawn.ID() or 0) == 0 then bad[#bad + 1] = name..' not in zone'
+        elseif m.Spawn.Dead() then bad[#bad + 1] = name..' dead'
+        elseif outside and d > START.GATHER then bad[#bad + 1] = string.format('%s %.0f away', name, d) end
+    end
+    if #bad == 0 then return true end
+    announce_g('Start: group not ready -- %s', table.concat(bad, ', '))
+    return false
+end
+
+-- Before the hail: everyone visible, the MA in SicTank (not Vorpal) and the rest in Chase.
+-- noauto, so the plugins' own auto mode switching leaves them there.
+local function start_group_modes()
     local ma = mq.TLO.Group.MainAssist()
     for i = 0, (mq.TLO.Group.Members() or 0) do
         local m = mq.TLO.Group.Member(i)
         local name, cls = m.Name(), m.Class.ShortName()
-        if name and cls then
+        if name and cls and not m.Mercenary() then
             local mode = (name == ma) and 7 or 2   -- 7 SicTank, 2 Chase
             if name == def.name then
                 mq.cmd("/makemevisible")
-                cwtn(string.format('mode %d noauto', mode))
+                cwtn('mode '..mode..' noauto')
             else
-                bct(name, "/makemevisible")
-                bct(name, "/%s mode %d noauto", cls:lower(), mode)
+                bct_np(name, IF_INGAME.."/makemevisible")
+                -- Boxr: the MA camps (nobody to chase), the rest chase
+                bct_mode(name, cls, 'mode '..mode..' noauto', mode == 7 and 'camp' or 'chase', nil, true)
             end
         end
     end
@@ -823,14 +953,16 @@ local function start_group_zone_in()
         return
     end
     local id = giver.ID()
-    start_group_setup()
+    -- marks this as a start-driven zone-in, on every box (event_zoned unpauses on landing)
+    START.zonein_at = mq.gettime()
+    bcge("%s start_zonein", def.cmd)
     debug_local('Start: telling the group to say ready to %s (%d)', tostring(giver.CleanName()), id)
     start_group_pause(true)
     -- give the pause time to land: a paladin's plugin retargets itself, and a /target
     -- sent before the pause takes hold is swapped straight back
     mq.delay(1500)
-    bcge_np(TARGET_IF_NEAR, id, def.TARGET_RANGE, id)
-    bcge_np("/docommand /timed ${Math.Rand[100]} /say ready")
+    bcge_np(TARGET_IF_NEAR_INGAME, id, def.TARGET_RANGE, id)
+    bcge_np(IF_INGAME.."/timed ${Math.Rand[100]} /say ready")
     announce('Start: group told to say ready to %s', tostring(giver.CleanName()))
 end
 
@@ -851,7 +983,7 @@ end
 START.GROUP_WAIT  = 60   -- s
 START.RESEND_EVERY = 30  -- s
 START.UNPAUSE_AFTER = 5  -- s after the whole party is in: the last one in may still be loading
-START.SPAWN_SETTLE = 12  -- s after that before moving, for spawn locations to update (zone-in only)
+START.SPAWN_SETTLE = 16  -- s after that before moving, for spawn locations to update (zone-in only)
 
 local function start_zone_in()
     if in_instance_zone() then return true end
@@ -894,9 +1026,9 @@ local function start_zone_in()
     return true
 end
 
--- Unpause the whole group at once, each toon for its own class plugin.
+-- Unpause the whole group at once, each toon for its own class plugin (or MQ2Boxr).
 local function start_group_unpause()
-    bcge_np("/docommand /${Me.Class.ShortName} pause off")
+    start_group_pause(false)
 end
 
 local function start_group_catchup()
@@ -926,7 +1058,7 @@ local function start_group_catchup()
             announce_g('Start: %s not in the mission yet -- re-sending ready', table.concat(list, ', '))
             -- nav first, target once there: a straggler can be well away from the giver
             for i, name in ipairs(list) do
-                bct(name, "/nav id %d distance=50 log=off", id)
+                bct_np(name, IF_INGAME.."/nav id %d distance=50 log=off", id)
                 due[name] = sent + 5000 + (i - 1) * 2000   -- 2s apart, not all at once
             end
         end
@@ -935,8 +1067,8 @@ local function start_group_catchup()
         for _, name in ipairs(list) do
             if due[name] and mq.gettime() >= due[name] then
                 due[name] = nil
-                bct_np(name, TARGET_IF_NEAR, id, def.TARGET_RANGE, id)
-                bct(name, "/timed 5 /say ready")
+                bct_np(name, TARGET_IF_NEAR_INGAME, id, def.TARGET_RANGE, id)
+                bct_np(name, IF_INGAME.."/timed 5 /say ready")
             end
         end
         mq.delay(1000)
@@ -954,7 +1086,8 @@ function Core.start_nav_clearing(spawn_name)
         for i = 1, 20 do
             local xt = mq.TLO.Me.XTarget(i)
             if (xt.ID() or 0) ~= 0 and xt.TargetType() == 'Auto Hater'
-                    and not (xt.Name() or ''):lower():find(spawn_name:lower(), 1, true) then
+                    and not (xt.Name() or ''):lower():find(spawn_name:lower(), 1, true)
+                    and xt_sane(xt.ID()) then
                 return xt.ID()
             end
         end
@@ -962,7 +1095,8 @@ function Core.start_nav_clearing(spawn_name)
     for _ = 1, 10 do   -- each pass: nav until done or something aggros
         mq.cmdf("/nav spawn %s", spawn_name)
         mq.delay(500)
-        while mq.TLO.Navigation.Active() and not hater() do mq.delay(250) end
+        local tn = mq.gettime()
+        while mq.TLO.Navigation.Active() and not hater() and (mq.gettime() - tn) < 60000 do mq.delay(250) end
         if not hater() then return true end
         if mq.TLO.Navigation.Active() then mq.cmd("/nav stop") end
         debug_local('Start: mobs on the way in, killing them first')
@@ -991,23 +1125,127 @@ local function start_event()
     if m and m.start then m.start() end
 end
 
--- /sorm start. From outside the mission the whole group has to say ready, not just us
--- (zone in only -- the start itself stays with whoever ran it). One start at a time: a
--- second click while the first is still zoning would say ready again on landing.
+-- Comms check before a start: every group member running sorm answers a ping with a
+-- pong (bind_raid). Anyone silent is told to start it (/lua run) and pinged again; false,
+-- with them named, if still silent.
+START.PING_WAIT = 3    -- s for the pongs
+START.LAUNCH_WAIT = 15 -- s re-pinging for a /lua run to come up
+START.pongs = {}
+local LUA_NAME = MOD:gsub('%.', '/')
+-- Start sorm on these toons (only if in game and not zoning). Harmless if already running.
+function Core.launch_sorm(names)
+    for _, n in ipairs(names) do bct_np(n, IF_INGAME.."/lua run %s", LUA_NAME) end
+end
+local function start_comms_check()
+    local function silent()
+        local out = {}
+        for i = 1, (mq.TLO.Group.Members() or 0) do
+            local m = mq.TLO.Group.Member(i)
+            local n = m.Name()
+            if n and not m.Mercenary() and not START.pongs[n:lower()] then out[#out + 1] = n end
+        end
+        return out
+    end
+    local function ping()
+        START.pongs = {}
+        -- the receiver runs it only if its sorm is up: a box without it would print
+        -- "Couldn't parse '/sorm ping'" on every round
+        bcge_np("/if (${Lua.Script[%s].Status.Equal[RUNNING]}) %s ping %s", LUA_NAME, def.cmd, def.name)
+        mq.delay(START.PING_WAIT * 1000, function() return #silent() == 0 end)
+        return silent()
+    end
+    local out = ping()
+    if #out == 0 then return true end
+    announce_g('Start: no answer from %s -- starting %s there', table.concat(out, ', '), LUA_NAME)
+    local launch = Core.launch_sorm
+    launch(out)
+    -- re-ping until all answer or LAUNCH_WAIT is up: a fresh script takes a few seconds.
+    -- The /lua run is re-sent to the still-silent every other round: a first one was seen
+    -- to arrive and not start the script (Echo, 2026-11-11). Running it twice is harmless.
+    local t0, round = mq.gettime(), 0
+    repeat
+        mq.delay(2000)
+        out = ping()
+        round = round + 1
+        if #out > 0 and round % 2 == 0 then launch(out) end
+    until #out == 0 or (mq.gettime() - t0) >= START.LAUNCH_WAIT * 1000
+    if #out == 0 then
+        announce('Start: whole group now running sorm')
+        return true
+    end
+    announce_g('Start: %s not running sorm (or not on DanNet/EQBC) -- /lua run %s there, then start again',
+        table.concat(out, ', '), LUA_NAME)
+    return false
+end
+
+-- The MA's group-wide settings to the rest of the group, once everyone runs sorm: a box
+-- whose sorm the comms check just launched has the defaults, and anything set before it
+-- ran (/sorm illusion skel) never reached it.
+local function start_push_settings()
+    bcge("%s burn %s", def.cmd, flags.BURN_MODE and 'on' or 'off')
+    local m = mission()
+    for _, c in ipairs(m and m.sync and m.sync() or {}) do bcge("%s %s", def.cmd, c) end
+end
+
+-- /sorm start: comms check, roles and group check, then the MA runs it -- started on
+-- anyone else it is handed to the MA, since the group Chases the MA, not us. The group
+-- is set to Chase noauto and the MA to SicTank. From outside the mission the whole group
+-- has to say ready, not just us. Inside, the group is unpaused before the hail. One
+-- start at a time: a second click while the first is still zoning would say ready again
+-- on landing.
 local function run_start()
+    START.queued = false
     if START.busy then printf('start already running') return end
     local m = mission()
     if m and m.can_start and not m.can_start() then return end
     START.busy = true
     local outside = not in_instance_zone()
+    if not (start_comms_check() and start_group_roles() and start_validate(outside)) then
+        START.busy = false
+        return
+    end
+    local ma = mq.TLO.Group.MainAssist()
+    if ma ~= def.name then
+        announce('Start: handing the start to the MA, %s', tostring(ma))
+        bct(ma, "%s start", def.cmd)
+        START.busy = false
+        return
+    end
+    start_push_settings()
+    -- Everyone's mode out here, put back when the mission ends (Core.mission_complete).
+    -- The group records its own on 'savemode'; the pause lets that land before the mode
+    -- changes below reach their plugins.
+    if outside then
+        START.saved_mode = get_cwtn_mode()
+        debug_local('Start: mode outside was %s', tostring(START.saved_mode))
+        bcge("%s savemode", def.cmd)
+        mq.delay(1500)
+    end
+    start_group_modes()
     if outside then start_group_zone_in() end
+    -- Everyone visible, first thing inside: invis put up outside or on the way in would
+    -- carry into the event (seen live 2026-11-11, Waxwork's first add wave with invis on)
+    local function group_visible()
+        mq.cmd("/makemevisible")
+        bcge_np(IF_INGAME.."/makemevisible")
+    end
     local ok, err = pcall(function()
+        if not outside then group_visible() end
         if outside then
             if not start_zone_in() then start_group_pause(false) return end
             if not start_group_catchup() then return end
-            announce('Start: group all in, %ds for client control', START.SPAWN_SETTLE)
+            group_visible()
+            -- unpaused for the wait, not after it: the plugins refresh buffs meanwhile
+            start_group_unpause()
+            resume()
+            announce('Start: group all in and unpaused, %ds for client control and buffs', START.SPAWN_SETTLE)
             mq.delay(START.SPAWN_SETTLE * 1000)
         end
+        -- everyone unpaused before the hail
+        start_group_unpause()
+        resume()
+        mq.delay(1000)
+        START.started = mq.TLO.Zone.ShortName()   -- until we leave this zone (Main clears it)
         start_event()
         local mode = get_cwtn_mode() or ''
         if mq.TLO.Group.MainAssist() == def.name and (mode:find('Sic') or mode == 'Camp') then
@@ -1032,6 +1270,22 @@ local function event_zoned(line,arg1,arg2)
     if arg2 ~= nil then
         State.current_task = read_task()
         if arg2~=State.current_task then debug_local('current_task: %s arg2: %s',State.current_task,arg2) end
+    end
+    -- Landed in a mission on a start's zone-in: unpause ourselves after a settle (a pause
+    -- off while the client is still loading is lost), so a toon the start paused comes
+    -- back even if the group unpause missed it. Only after a start (START.zonein_at, set
+    -- by the start's 'start_zonein' push), so a toon paused by hand stays paused. A CWTN
+    -- plugin only if it is paused: an unneeded resume would resetcamp a SicTank MA.
+    local started = START.zonein_at and (mq.gettime() - START.zonein_at) < START.ZONEIN_VALID * 1000
+    if in_instance_zone() and started then
+        START.zonein_at = nil
+        Core.defer(function()
+            mq.delay(START.SETTLE * 1000)
+            local ok, paused = pcall(function() return mq.TLO.CWTN.Paused() end)
+            if isclass_plugin_loaded() and not (ok and paused) then return end
+            announce('In the mission: unpausing')
+            resume()
+        end)
     end
 end
 local function event_assigned(line,arg1)
@@ -1080,7 +1334,27 @@ local function bind_raid(...)
         flags.PAUSED = bool_arg(value, flags.PAUSED)
         printf('sorm %s', flags.PAUSED and 'PAUSED' or 'resumed')
     elseif (key == 'start') then
-        run_start()
+        -- Guarded here, not just in run_start: a second start that arrives while the first
+        -- runs would queue and run straight after it. Once a mission is started in this
+        -- zone, only 'start force' runs it again.
+        if START.busy or START.queued then
+            printf('start already running')
+        elseif START.started == mq.TLO.Zone.ShortName() and value ~= 'force' then
+            printf('already started here -- %s start force to run it again', def.cmd)
+        else
+            START.queued = true
+            announce('Start: requested for %s -- checking the group', tostring(State.current_task))
+            Core.defer(run_start)
+        end
+    elseif key == 'ping' and value then   -- start's comms check: answer whoever asked
+        bct_q(value, "%s pong %s", def.cmd, def.name)
+    elseif key == 'pong' and value then
+        START.pongs[value:lower()] = true
+    elseif key == 'start_zonein' then   -- the MA's start is zoning us in (event_zoned)
+        START.zonein_at = mq.gettime()
+    elseif key == 'savemode' then   -- the MA's start: remember our mode outside
+        START.saved_mode = get_cwtn_mode()
+        debug_local('Start: mode outside was %s', tostring(START.saved_mode))
     elseif (key == 'debug') then
         if value == 'on' then def.DEBUG = true
         elseif value == 'off' then def.DEBUG = false
@@ -1173,7 +1447,13 @@ local function ui()
     else ImGui.TextColored(COLOR.GREY, tostring(State.current_task or 'None')) end
     if m then
         ImGui.SameLine()
-        if ImGui.Button('Start Event') then mq.cmdf("%s start", def.cmd) end
+        if START.busy or START.queued then
+            ImGui.TextColored(COLOR.AMBER, 'Starting...')
+        elseif START.started == mq.TLO.Zone.ShortName() then
+            ImGui.TextColored(COLOR.GREEN, 'Started')
+        elseif ImGui.Button('Start Event') then
+            mq.cmdf("%s start", def.cmd)
+        end
     end
 
     ImGui.Separator()
@@ -1221,6 +1501,7 @@ end
 -- ============================================================
 
 local function Init()
+    if not check_plugins() then mq.exit() end
     -- per-toon seed: unseeded, every client draws the same "random" pulse jitter
     math.randomseed(os.time() + (mq.TLO.Me.ID() or 0))
     for m in each_mission() do
@@ -1240,70 +1521,96 @@ local function Init()
     mq.event('zoned', '#*#You have entered #1#:#2#.', event_zoned)
     mq.event('assigned', '#*#You have been assigned the task \'#1#\'.', event_assigned)
 
-    ensure_mode_control()
     mq.bind(def.cmd, bind_raid)
     check_eqbc_default()
     mq.imgui.init('SoR Missions', ui)
+end
+
+-- Mission done (boss step passed, or a mission's own kill event), on every toon: back to
+-- the mode we had outside when the start began (START.saved_mode). Nothing recorded (a
+-- start run from inside): the MA goes to Manual, so SicTank does not run off after
+-- anything else, and the rest are left as they are. Once per kill: both can fire for one.
+local completed_at = 0
+function Core.mission_complete()
+    if mq.gettime() - completed_at < 60000 then return end
+    completed_at = mq.gettime()
+    local m = START.saved_mode
+    START.saved_mode = nil
+    local is_ma = mq.TLO.Group.MainAssist() == def.name
+    if not m then
+        if is_ma then
+            cwtn('mode 0')
+            announce('Mission complete: MA set to Manual')
+        end
+    elseif m == 'Manual' or m == 'none' then
+        cwtn('mode 0')
+        announce('Mission complete: back to Manual')
+    elseif Core.MODE_NUM[(tostring(m):gsub(' ', ''))] then
+        set_mode(m)
+        announce('Mission complete: back to %s', tostring(m))
+    else
+        if is_ma then cwtn('mode 0') end
+        announce_g('Mission complete: could not restore mode "%s"%s', tostring(m), is_ma and ' -- MA set to Manual' or '')
+    end
 end
 
 local function Main()
     local was_group_ma = nil   -- nil: the first pulse always applies the role
     local was_task = nil
     local was_step = nil      -- last task step, to see the boss step move on
-    -- one pass of the main loop; skipped while paused
-    local function pulse()
-        State.current_task = read_task()
-        local m = mission()
-        -- Boss death from the task, not the spawn: the Abolishion despawns every wave.
-        local step = State.current_task ~= 'None' and mq.TLO.Task(1).Step() or nil
-        if step and step ~= '' and step ~= was_step then
-            local boss = was_step and was_step:match('^Defeat (.+)$')
-            if boss and not (m and m.own_kill_announce) then
-                announce('%s dead, Mission Complete!', (boss:gsub('^the ', '')))
-            end
-            was_step = step
-        end
-        -- Only run inside one of this script's missions. Out of them -- another zone's
-        -- task, or none -- nothing but events runs, so MA mode cannot take over targeting
-        -- in some other zone (seen in the live relic zone).
-        local in_task = m ~= nil
-        if State.current_task ~= was_task then
-            was_task = State.current_task
-            announce('Task "%s": %s', tostring(State.current_task), in_task and 'active' or 'not one of ours, idle')
-            if not in_task then reset_engage() end
-            if m and m.enter then m.enter() end
-        end
-        -- MA mode follows the group's Main Assist role. Only acted on when the role
-        -- changes, so a manual toggle holds until the next change.
-        local is_ma = mq.TLO.Group.MainAssist() == def.name
-        if is_ma ~= was_group_ma then
-            was_group_ma = is_ma
-            flags.MA_MODE = is_ma
-            announce('%s group MA: MA mode %s', is_ma and 'Now' or 'No longer', is_ma and 'on' or 'off')
-            if m and m.ma_changed then m.ma_changed(is_ma) end
-        end
-        if m and m.pre_pulse then m.pre_pulse() end
-        if in_task and flags.MA_MODE and not (m.hold and m.hold()) then
-            pick_target()
-            BOXR_RG.close_in()   -- RGMercs MA only: walk in to a target out of reach
-        end
-        mq.doevents()   -- always: the zone/task events are what set current_task
-
-        if in_task then
-            check_burn()
-            if m.pulse then m.pulse() end
-        end
-
-        -- jittered so the toons do not all pulse in step
-        mq.delay(def.pulse + math.random(0, 150))
-    end
 
     while State.OPENGUI do   -- closing the window ends the script
+        -- queued command work, paused or not: it was asked for by hand
+        while #deferred > 0 do table.remove(deferred, 1)() end
+        -- left the zone a start ran in: a new instance can be started again
+        if START.started and START.started ~= mq.TLO.Zone.ShortName() then START.started = nil end
         if flags.PAUSED then
             mq.flushevents()   -- drop what was heard while paused, so nothing fires late
             mq.delay(def.pulse)
         else
-            pulse()
+            State.current_task = read_task()
+            local m = mission()
+            -- Boss death from the task, not the spawn: the Abolishion despawns every wave.
+            local step = State.current_task ~= 'None' and mq.TLO.Task(State.current_task).Step() or nil
+            if step and step ~= '' and step ~= was_step then
+                local boss = was_step and was_step:match('^Defeat (.+)$')
+                if boss and not (m and m.own_kill_announce) then
+                    announce('%s dead, Mission Complete!', (boss:gsub('^the ', '')))
+                end
+                if boss then Core.mission_complete() end
+                was_step = step
+            end
+            -- Only run inside one of this script's missions. Out of them -- another zone's
+            -- task, or none -- nothing but events runs, so MA does not take over targeting outside
+            local in_task = m ~= nil
+            if State.current_task ~= was_task then
+                was_task = State.current_task
+                announce('Task "%s": %s', tostring(State.current_task), in_task and 'active' or 'not one of ours, idle')
+                if not in_task then reset_engage() end
+                if m and m.enter then m.enter() end
+            end
+            -- MA mode follows the group's Main Assist role.
+            local is_ma = mq.TLO.Group.MainAssist() == def.name
+            if is_ma ~= was_group_ma then
+                was_group_ma = is_ma
+                flags.MA_MODE = is_ma
+                announce('%s group MA: MA mode %s', is_ma and 'Now' or 'No longer', is_ma and 'on' or 'off')
+                if m and m.ma_changed then m.ma_changed(is_ma) end
+            end
+            if m and m.pre_pulse then m.pre_pulse() end
+            if in_task and flags.MA_MODE and not (m.hold and m.hold()) then
+                pick_target()
+                BOXR_RG.close_in()   -- RGMercs MA only: walk in to a target out of reach
+            end
+            mq.doevents()   -- always: the zone/task events are what set current_task
+
+            if in_task then
+                check_burn()
+                if m.pulse then m.pulse() end
+            end
+
+            -- jittered so the toons do not all pulse in step
+            mq.delay(def.pulse + math.random(0, 150))
         end
     end
 end

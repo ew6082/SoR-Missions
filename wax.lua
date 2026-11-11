@@ -29,6 +29,8 @@ kill_order[W.TASK] = {"Waxwork_Lancer","Waxwork_Igniter","Waxwork_Trapper","Waxw
 -- margin left the group well behind.
 local wax_st = {}
 wax_st.SPREAD = 8     -- target spread, shown in the UI
+wax_st.SWITCH_GAP = 800      -- ms between balance target switches, plus...
+wax_st.SWITCH_JITTER = 350   -- ...a random 0..this ms
 wax_st.spread = nil   -- current HP spread across the adds, for the UI (nil: not balancing)
 wax_st.wave_max = 0   -- most adds seen live at once this wave
 wax_st.finishing = false
@@ -53,7 +55,8 @@ local function wax_live_adds()
         local id = xt.ID() or 0
         -- Type NPC: a corpse sits on xtarget for a beat at its last HP (seen live 2026-11-06,
         -- "Balance: -> Waxwork Igniter's corpse 9%")
-        if id ~= 0 and xt.TargetType() == 'Auto Hater' and xt.Type() == 'NPC' and is_wax_add(xt.Name()) then
+        if id ~= 0 and xt.TargetType() == 'Auto Hater' and xt.Type() == 'NPC' and is_wax_add(xt.Name())
+                and Core.xt_sane(id) then
             local hp = xt.PctHPs()
             if hp and hp > 0 then set[#set + 1] = { id = id, hp = hp, name = xt.CleanName() } end
         end
@@ -125,12 +128,17 @@ local function wax_balance_pick()
     -- The nukers' damage lands a cast time after the switch, so the add we are on still
     -- reads high and staying on "the highest" overshot it -- the spread swung 15-48% (seen
     -- live 2026-11-06). Rotating through the top of the pack spreads that lag across them.
-    -- Once per pulse, not slower: a 1s minimum gap let the spread reach 42% and only one
-    -- add of five died (seen live 2026-11-06).
+    -- Gap between switches: SWITCH_GAP + random(0, SWITCH_JITTER) ms. Checked once a
+    -- pulse, so the real gap rounds up to the next pulse. A 1s minimum gap once let the
+    -- spread reach 42% (2026-11-06), but at 700+250 the spread held 7-8% over two runs
+    -- (2026-11-11, measured gaps ~1.0-1.4s median).
+    local now = mq.gettime()
+    if now < (wax_st.next_switch or 0) then return true end
     table.sort(set, function(a, b) return a.hp > b.hp end)
     for _, s in ipairs(set) do
         if s.id ~= tid then
             switch_to(s, string.format('spread %d%%', wax_st.spread))
+            wax_st.next_switch = now + wax_st.SWITCH_GAP + math.random(0, wax_st.SWITCH_JITTER)
             break
         end
     end
@@ -234,7 +242,7 @@ local function wax_step(uy, ux, dist)
         my + uy * (dist + WAX.BEHIND), mx + ux * (dist + WAX.BEHIND), mz)
     Core.wait_nav()
     local y, x = mq.TLO.Me.Y(), mq.TLO.Me.X()
-    return (y and x and math.sqrt((y - my)^2 + (x - mx)^2) or 0) >= 1
+    return (y and x and Core.dist_yx(y, x, my, mx) or 0) >= 1
 end
 
 -- The group in Manual for the step-out and hold, or Chase pulls them straight back to the
@@ -247,7 +255,7 @@ local function wax_group_manual(on)
     for i = 1, (mq.TLO.Group.Members() or 0) do
         local m = mq.TLO.Group.Member(i)
         local name, cls = m.Name(), m.Class.ShortName()
-        if name and cls then Core.bct(name, "/%s mode %d", cls:lower(), on and 0 or 2) end
+        if name and cls then Core.bct_mode(name, cls, on and 'mode 0' or 'mode 2', on and 'manual' or 'chase') end
     end
 end
 
@@ -381,7 +389,7 @@ function W.ui()
             ImGui.Text('HP spread:')
             ImGui.SameLine()
             ImGui.TextColored(wax_st.spread > wax_st.SPREAD and COLOR.AMBER or COLOR.GREEN,
-                string.format('%d%% (target %d%%)', wax_st.spread, wax_st.SPREAD))
+                '%d%% (target %d%%)', wax_st.spread, wax_st.SPREAD)
         else
             ImGui.TextDisabled('HP spread: None')
         end

@@ -51,7 +51,7 @@ local aura_st = { stripped = {}, did_workers = false, went_colossus = false }
 local function worker_hater(pair)
     for i = 1, 20 do
         local xt = mq.TLO.Me.XTarget(i)
-        if (xt.CleanName() or ''):lower():find(pair.worker, 1, true) then return xt.ID() end
+        if (xt.CleanName() or ''):lower():find(pair.worker, 1, true) and Core.xt_sane(xt.ID()) then return xt.ID() end
     end
 end
 
@@ -107,7 +107,7 @@ local function do_aura_follow(aura_name, tid, needed, cap)
         local off = dist2d(y, x)
         local mob = mq.TLO.Spawn(tid)
         if mob() and mob.Y() and mob.X() then
-            off = math.sqrt((mob.Y() - y)^2 + (mob.X() - x)^2)
+            off = Core.dist_yx(mob.Y(), mob.X(), y, x)
         end
         -- Waiting in the aura is pointless if the mob is beating on someone else: it never
         -- comes. Run to it and get its attention back, then the next pulses lead it in.
@@ -298,8 +298,7 @@ end
 -- takes it from there (nearest aura, its worker, then the other).
 function CO.start()
     mq.cmd("/nav locyxz -415 1825 1775 distance=10 log=off")
-    mq.delay(500)
-    while mq.TLO.Navigation.Active() do mq.delay(250) end
+    Core.wait_nav(60)
     local torm = mq.TLO.Spawn("npc Torm")
     if not (torm() and safe_target(torm.ID())) then
         announce_g('Start: Torm not in reach -- start it by hand')

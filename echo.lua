@@ -148,7 +148,7 @@ local function echo_wait_ma_port(label)
         local s = mq.TLO.Spawn("pc ="..ma)
         if not s() then return true end   -- not in zone (or dead): nothing to wait for
         local y, x = s.Y(), s.X()
-        return y and x and math.sqrt((y - ECHO.center[1])^2 + (x - ECHO.center[2])^2) > ECHO.CENTER_MAX or false
+        return y and x and Core.dist_yx(y, x, ECHO.center[1], ECHO.center[2]) > ECHO.CENTER_MAX or false
     end
     if ma_gone() then return end
     announce('Echo: on the %s switch, waiting for %s to port first', label, ma)
@@ -177,7 +177,7 @@ local function echo_wait_nav_or_summon()
     local function jumped()
         local y, x = pos()
         if not (y and x and y0 and x0) then return false end
-        local d = math.sqrt((y - y0)^2 + (x - x0)^2)
+        local d = Core.dist_yx(y, x, y0, x0)
         y0, x0 = y, x
         return d > 60   -- in 100ms; run speed covers a few units
     end
@@ -236,7 +236,7 @@ local function echo_click_switch(loc, label, ma_first)
     local y0, x0 = mq.TLO.Me.Y(), mq.TLO.Me.X()
     local function jumped()
         local y, x = mq.TLO.Me.Y(), mq.TLO.Me.X()
-        return (y and x and y0 and x0) and math.sqrt((y - y0)^2 + (x - x0)^2) > 150 or false
+        return (y and x and y0 and x0) and Core.dist_yx(y, x, y0, x0) > 150 or false
     end
     -- By name: a bare /doortarget took the nearest door, once an OBJ_DOORXL we had slid
     -- up to. There are more magic switches out in the labyrinth, so also check this one
@@ -244,7 +244,7 @@ local function echo_click_switch(loc, label, ma_first)
     mq.cmd("/doortarget OBJ_MAGICSWITCH")
     mq.delay(200)
     local d = mq.TLO.DoorTarget
-    local off = math.sqrt(((d.Y() or 1e6) - loc[1])^2 + ((d.X() or 1e6) - loc[2])^2)
+    local off = Core.dist_yx(d.Y() or 1e6, d.X() or 1e6, loc[1], loc[2])
     if off > 15 then
         debug_local('Echo: nearest switch (%s) is %.0f from the %s switch spot', tostring(d.ID()), off, label)
         return false, 'miss'
@@ -360,7 +360,7 @@ local function echo_restore_xtargethealnpc()
     if v == nil then
         announce_g('Echo: could not read xtargethealnpc earlier -- left it off')
     else
-        cwtn(string.format("xtargethealnpc %s nosave", v and 'on' or 'off'))
+        cwtn("xtargethealnpc "..(v and 'on' or 'off').." nosave")
         debug_local('Echo: Flagellant gone, xtargethealnpc back %s', v and 'on' or 'off')
     end
     return true
@@ -439,7 +439,7 @@ local function echo_room(dir)
         -- A summon is a jump no run can make in one pulse. Caught by the jump, not just by
         -- landing in the middle, so do_echo_room knows not to go back for the switch.
         local cy, cx = mq.TLO.Me.Y(), mq.TLO.Me.X()
-        if cy and cx and py and px and math.sqrt((cy - py)^2 + (cx - px)^2) > ECHO.SUMMON_JUMP
+        if cy and cx and py and px and Core.dist_yx(cy, cx, py, px) > ECHO.SUMMON_JUMP
            and not echo_st.summoned then
             echo_st.summoned = true
             announce_g('Echo: %s summoned out of the %s room', def.name, dir)
@@ -509,7 +509,7 @@ local function echo_room(dir)
                     -- the MA included -- engages until the mini is under AutoAssistAt (seen
                     -- live 2026-11-01: Dark Stranger at 100% on a merc, the group idle).
                     if ma == def.name then m = 7 end
-                    if m then cwtn(string.format("mode %d", m)) end
+                    if m then cwtn("mode "..m) end
                     -- the mode change can drop the /attack on sent when the mini showed
                     if ma == def.name and dir ~= 'north' then
                         mq.delay(250)
@@ -568,7 +568,7 @@ local function echo_lings()
         end
         if not found then return false end
         local y, x = s.Y(), s.X()
-        return y and x and math.sqrt((y - ECHO.center[1])^2 + (x - ECHO.center[2])^2) < ECHO.LING_RADIUS or false
+        return y and x and Core.dist_yx(y, x, ECHO.center[1], ECHO.center[2]) < ECHO.LING_RADIUS or false
     end)
 end
 local function echo_ling_count() return #echo_lings() end
@@ -634,7 +634,7 @@ local function echo_ma_left_room()
     local s = mq.TLO.Spawn("pc ="..ma)
     if not s() then return false end
     local y, x = s.Y(), s.X()
-    return y and x and math.sqrt((y - ECHO.center[1])^2 + (x - ECHO.center[2])^2) < ECHO.CENTER_MAX or false
+    return y and x and Core.dist_yx(y, x, ECHO.center[1], ECHO.center[2]) < ECHO.CENTER_MAX or false
 end
 
 local function echo_clear_adds(before)
@@ -680,6 +680,9 @@ end
 local function echo_sync()
     if not flags.MA_MODE then return end
     Core.bcge("%s echonext %s", def.cmd, ECHO.order[echo_st.next] or 'done')
+    -- and the group-wide settings: a box asking is one whose sorm just (re)started, on
+    -- the defaults (E.sync, below)
+    for _, c in ipairs(E.sync()) do Core.bcge("%s %s", def.cmd, c) end
 end
 
 -- ============================================================
@@ -702,17 +705,19 @@ local function has_illusion()
     return race and race:find(wanted_illusion().race) ~= nil or false
 end
 
--- Does the whole group carry the selected illusion's item? Every member (us too) answers
--- with plain commands, so no sorm is needed on them: "ECHOITEMS <name> <amulet 0/1>
--- <veil 0/1>". Run when Skeleton or Jann is picked in the UI and again at Start; anyone
+-- Does the whole group carry the selected illusion's item? Every member answers with a
+-- plain EQBC/DanNet command back to us, so no sorm is needed on them: "/sorm echoitems
+-- <name> <amulet 0/1> <veil 0/1>", sent to us alone and squelched -- no /echo on every
+-- box. Run when Skeleton or Jann is picked in the UI and again at Start; anyone
 -- missing it shows as a UI warning and refuses the start. Never switches the type itself.
 -- Skipped with Other (flags.ILLUSION_OTHER), the default.
 ECHO.POLL_WAIT = 8   -- s for the answers
+ECHO.RELAUNCH_WAIT = 5   -- s after starting sorm on a silent box, before asking again
 echo_st.poll = {}
 echo_st.illusion_missing = nil   -- who lacks the selected item, from the last check (UI)
 echo_st.illusion_check_pending = false   -- set by the UI radio, run from Main (it blocks)
--- Only 0/1 answers count: our own outgoing command echoes the unexpanded ${...} text.
-local function event_echo_items(line, name, skel, jann)
+-- An answer (the echoitems command). Only 0/1 count: anything else is a garbled reply.
+local function echo_items_answer(name, skel, jann)
     if (skel ~= '0' and skel ~= '1') or (jann ~= '0' and jann ~= '1') or not name then return end
     echo_st.poll[name:lower()] = { skel = skel == '1', jann = jann == '1' }
 end
@@ -741,25 +746,43 @@ local function echo_illusion_check(auto)
     echo_st.poll = { [def.name:lower()] = {
         skel = mq.TLO.FindItem('=Amulet of Necropotence')() ~= nil,
         jann = mq.TLO.FindItem("=Jann's Veil")() ~= nil } }
-    local q = "ECHOITEMS ${Me.CleanName} ${If[${FindItem[=Amulet of Necropotence].ID},1,0]} ${If[${FindItem[=Jann's Veil].ID},1,0]}"
-    -- reply as an announce_g: an /echo on the rest of the group, not the whole network
-    Core.bcg_np("/docommand %s/echo SOR-Missions [${Me.CleanName}]: %s", flags.USE_EQBC and '/bcg /' or '/dgge ', q)
-    local t0 = mq.gettime()
-    while (mq.gettime() - t0) < ECHO.POLL_WAIT * 1000 do
-        mq.doevents('echoitems')
-        local all = true
-        for _, n in ipairs(members) do
-            if not echo_st.poll[n:lower()] then all = false break end
+    -- each of the rest expands its own ${...} and sends the answer to us alone, squelched
+    local back = flags.USE_EQBC and ('/bct '..def.name..' /') or ('/dex '..def.name..' ')
+    local q = "/squelch "..back..def.cmd.." echoitems ${Me.CleanName} ${If[${FindItem[=Amulet of Necropotence].ID},1,0]} ${If[${FindItem[=Jann's Veil].ID},1,0]}"
+    local function poll()
+        Core.bcge_np("%s", q)
+        local t0 = mq.gettime()
+        while (mq.gettime() - t0) < ECHO.POLL_WAIT * 1000 do
+            local all = true
+            for _, n in ipairs(members) do
+                if not echo_st.poll[n:lower()] then all = false break end
+            end
+            if all then break end
+            mq.delay(250)
         end
-        if all then break end
-        mq.delay(250)
+    end
+    local function silent()
+        local out = {}
+        for _, n in ipairs(members) do
+            if not echo_st.poll[n:lower()] then out[#out + 1] = n end
+        end
+        return out
+    end
+    poll()
+    -- No answer: that box is stuck or its client is not taking commands. Start sorm on it
+    -- (the same push as the start's comms check) and ask once more.
+    local quiet = silent()
+    if #quiet > 0 then
+        announce_g('Echo: no item answer from %s -- starting sorm there and asking again', table.concat(quiet, ', '))
+        Core.launch_sorm(quiet)
+        mq.delay(ECHO.RELAUNCH_WAIT * 1000)
+        poll()
     end
     local key = flags.USE_SKEL and 'skel' or 'jann'
-    local no_reply, no_item = {}, {}
+    local no_reply, no_item = silent(), {}
     for _, n in ipairs(members) do
         local r = echo_st.poll[n:lower()]
-        if not r then no_reply[#no_reply + 1] = n
-        elseif not r[key] then no_item[#no_item + 1] = n end
+        if r and not r[key] then no_item[#no_item + 1] = n end
     end
     local why
     if #no_item > 0 then
@@ -838,6 +861,7 @@ end
 local function event_echo_defeated()
     echo_st.defeated = true
     announce('Echo of Hate dead, Mission Complete!')
+    Core.mission_complete()
     mq.delay(500 + math.random(0,5000))
     announce('Echo of Hate defeated: removing the illusion')
     if mq.TLO.Me.Buff('Illusion: ')() then mq.cmd("/removebuff Illusion:") end
@@ -925,10 +949,10 @@ local function echo_group_illusion()
                 elseif m.class == 'brd' then
                     -- a playing song (or one the plugin restarts) kills the click's cast:
                     -- pause, let the song stop, click, then hand the bard back after the cast
-                    Core.bct(m.name, "/brd pause on")
+                    Core.bct_mode(m.name, 'BRD', 'pause on', 'pause')
                     Core.bct(m.name, "/stopsong")
                     Core.bct(m.name, '/timed 10 /useitem "%s"', ill.item)
-                    Core.bct(m.name, "/timed 35 /brd pause off")   -- click at 1s + 1.5s cast + 1s spare
+                    Core.bct_mode(m.name, 'BRD', 'pause off', 'unpause', 35)   -- click at 1s + 1.5s cast + 1s spare
                 else
                     Core.bct(m.name, '/useitem "%s"', ill.item)
                 end
@@ -1008,9 +1032,15 @@ local function do_echo_room()
     echo_manual()
     -- Summoned out of the room: we are already with the Echo. Never go back for the
     -- room's switch (seen live 2026-11-02, a summoned tank ran back out to click it).
+    -- Already in the middle counts too: a summon after echo_room's watch ended (during the
+    -- add clear) is not caught as a jump (seen live 2026-11-11, a box summoned in east,
+    -- then "the east switch is out of reach (436)" from the middle).
     local back
     if echo_st.summoned then
         announce_g('Echo: %s was summoned out of the %s room -- not going back for its switch', def.name, dir)
+        back = true
+    elseif echo_where() == 'center' then
+        announce('Echo: already back in the middle (summoned) -- not going back for the %s switch', dir)
         back = true
     else
         back = echo_port('center')
@@ -1315,8 +1345,7 @@ local function do_npc_give_money(qty, npc)
     local id = mob.ID()
     if (mob.Distance() or 999) > MAX_DISTANCE then
         mq.cmdf("/nav id %s distance=10 log=off", id)
-        mq.delay(500)
-        while mq.TLO.Navigation.Active() do mq.delay(100) end
+        Core.wait_nav()
     end
     mob = mq.TLO.Spawn(id)
     if not mob() or (mob.Distance() or 999) > MAX_DISTANCE then
@@ -1424,7 +1453,6 @@ function E.events()
     mq.event('greedling', '#*#A greedling stops and sniffs the air, holding its hand out#*#', trigger_greedling)
     mq.event('echo_wax', '#*#The Echo destroys the mystical candles and takes their magic to form its own creation#*#', event_wax_spawn)
     mq.event('echo_defeated', '#*#You have defeated Echo of Hate.#*#', event_echo_defeated)
-    mq.event('echoitems', '#*#ECHOITEMS #1# #2# #3#', event_echo_items)
 end
 
 -- Echo task just came up: the group MA checks the selected illusion item (a no-op on
@@ -1510,8 +1538,7 @@ function E.start()
         return
     end
     mq.cmdf("/nav id %d distance=15 log=off", e.ID())
-    mq.delay(500)
-    while mq.TLO.Navigation.Active() do mq.delay(250) end
+    Core.wait_nav(60)
     mq.delay(500)
     safe_target(e.ID())
     mq.delay(500)
@@ -1536,8 +1563,9 @@ E.commands = {
             flags.KILL_GREEDLING and 'MA kills it' or 'MA ignores it')
     end,
     -- The UI's Give Now goes through here: npc_give_money blocks on nav and window
-    -- waits, which an ImGui callback cannot do. Not gated on GREEDLING_GIVE_PLAT.
-    givenow = function() npc_give_money(5, 'greedling') end,
+    -- waits, which an ImGui callback cannot do, so the main loop runs it. Not gated on
+    -- GREEDLING_GIVE_PLAT.
+    givenow = function() Core.defer(function() npc_give_money(5, 'greedling') end) end,
     echo = function(value)
         if value == 'stop' then
             echo_st.abort = true
@@ -1601,7 +1629,19 @@ E.commands = {
     end,
     -- On the MA: push our room count to the group. Anywhere else it does nothing.
     echosync = function() echo_sync() end,
+    -- an answer to our illusion item check: echoitems <name> <amulet 0/1> <veil 0/1>
+    echoitems = function(name, args) echo_items_answer(name, args[3], args[4]) end,
 }
+
+-- Group-wide settings the MA pushes on a start (Core start_push_settings): a sorm just
+-- launched on a box has the defaults, and an illusion set before it ran never reached it.
+function E.sync()
+    return {
+        'illusion '..(flags.ILLUSION_OTHER and 'other' or (flags.USE_SKEL and 'skel' or 'jann')),
+        'healnorth '..(flags.HEAL_NORTH and 'on' or 'off'),
+        'p2burn '..(flags.P2_FULLBURN and 'on' or 'off'),
+    }
+end
 
 function E.usage(c)
     print('  Echo of Hate:')

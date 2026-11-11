@@ -45,7 +45,7 @@ local function storm_near(list, y, x, radius)
     radius = radius or STORM.DANGER
     for _, s in ipairs(list) do
         local sy, sx = s.Y(), s.X()
-        if sy and sx and math.sqrt((sy - y)^2 + (sx - x)^2) < radius then return true end
+        if sy and sx and Core.dist_yx(sy, sx, y, x) < radius then return true end
     end
     return false
 end
@@ -201,6 +201,7 @@ end
 -- /sorm storm_call.assigned, or /sorm assign_circle <name> from anyone in the group) runs into the
 -- nearest call on the shar_storm emote, stands in it until it is gone, then backs to the banner.
 local storm_call = {}
+STORM.CIRCLE_MAX = 120   -- s cap on standing in one Storm Call
 storm_call.assigned = 0
 storm_call.count = 0   -- Storm Calls up
 storm_call.storms = 0  -- '_storm' spawns up, counted per pulse for the UI
@@ -222,10 +223,18 @@ local function go_to_circle()
     announce('Navigating to aura: %s (id %s)', spawn.Name(), tostring(sid))
     mq.cmd("/dism")
     mq.cmdf("/nav id %s distance=5",sid)
-    mq.delay(500)
     debug_local('Navigating to circle(init)')
-    while mq.TLO.Navigation.Active() do mq.delay(500) end
+    Core.wait_nav()
+    local t0 = mq.gettime()
     while (spawn() ~= nil) do
+        if mq.TLO.Me.Dead() then
+            announce_g('Died in the Storm Call circle -- giving up on it')
+            break
+        end
+        if (mq.gettime() - t0) > STORM.CIRCLE_MAX * 1000 then
+            announce_g('Storm Call still up after %ds -- leaving the circle', STORM.CIRCLE_MAX)
+            break
+        end
         -- Arrived: nav finished and we're close enough
         if not mq.TLO.Navigation.Active() and (spawn.Distance() or 999) < 10 then
             debug_local('Arrived at aura')
@@ -233,7 +242,7 @@ local function go_to_circle()
         -- Re-issue nav if it dropped but we're still far
         if not mq.TLO.Navigation.Active() or ((spawn.Distance() or 0) > 20) then
             debug_local('Navigating to circle(distance)')
-            mq.cmdf("/nav id %s facing=backwards distance=5 log=off",sid)
+            mq.cmdf("/nav id %s facing=backward distance=5 log=off",sid)
         end
         debug_local('While loop tail end')
         mq.delay(def.pulse)
@@ -244,7 +253,8 @@ local function go_to_circle()
     if safe then
         announce('Storm Call gone, returning to %s', safe)
         -- Mounted: back up, or we overrun the banner and fall off
-        mq.cmdf("/nav spawn %s%s", safe, mq.TLO.Me.Mount() and ' facing=backwards' or '')
+        -- /nav spawn takes its options after a '|' (the rest is the spawn search)
+        mq.cmdf("/nav spawn %s%s", safe, mq.TLO.Me.Mount() and ' | facing=backward' or '')
         local started = mq.gettime()
         mq.delay(500)
         while mq.TLO.Navigation.Active() and (mq.gettime() - started) < 30000 do mq.delay(250) end
@@ -309,8 +319,7 @@ end
 
 function M.start()
     mq.cmd("/nav spawn gwark")
-    mq.delay(500)
-    while mq.TLO.Navigation.Active() do mq.delay(250) end
+    Core.wait_nav(60)
     local gwark = mq.TLO.Spawn("npc gwark")
     if not (gwark() and Core.safe_target(gwark.ID())) then
         announce_g('Start: Gwark not in reach -- start it by hand')
@@ -334,7 +343,7 @@ M.commands = {
     circle = function(value)
         if value == 'now' then
             storm_call.assigned = math.max(storm_call.assigned, 1)   -- run the nearest Storm Call now
-            do_assigned_circle()
+            Core.defer(do_assigned_circle)   -- blocks on nav: the main loop runs it
         else
             storm_call.assigned = Core.bool_arg(value, storm_call.assigned >= 1) and 1 or 0
             printf('Storm Call circles: %s', storm_call.assigned >= 1 and 'on' or 'off')
@@ -372,7 +381,7 @@ function M.ui()
     ImGui.SameLine()
     flags.DODGE_STORMS = Core.toggle_button('dodge', flags.DODGE_STORMS)
     ImGui.SameLine()
-    ImGui.TextDisabled(string.format('(%d up)', storm_call.storms))
+    ImGui.TextDisabled('(%d up)', storm_call.storms)
     Core.status_flag('Storm Call circles:', storm_call.assigned >= 1)
     ImGui.SameLine()
     local on = Core.toggle_button('circle', storm_call.assigned >= 1)
@@ -380,7 +389,7 @@ function M.ui()
     ImGui.SameLine()
     if flags.DOING_CIRCLE then ImGui.TextColored(COLOR.AMBER, 'in circle')
     elseif flags.BURN_MODE and storm_call.assigned >= 1 then ImGui.TextDisabled('(slow mode only)')
-    else ImGui.TextDisabled(string.format('(%d up)', storm_call.count)) end
+    else ImGui.TextDisabled('(%d up)', storm_call.count) end
 end
 
 return M
