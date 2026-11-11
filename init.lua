@@ -34,7 +34,7 @@ local mq = require("mq")
 require("ImGui")
 
 -- This folder's module name, from where this file sits under the lua folder:
--- 'SoR-Missions' standalone, 'rip.SoR-Missions' in the rip download. The same files then
+-- 'SoR-Missions' standalone, 'subfolder.SoR-Missions' in the other github folder. The same files then
 -- work in either place.
 local function module_name()
     local src = debug.getinfo(1, 'S').source:gsub('^@', ''):gsub('\\', '/')
@@ -111,7 +111,7 @@ function Core.defer(fn) deferred[#deferred + 1] = fn end
 -- ============================================================
 
 -- EQBC is the default when MQ2EQBC is loaded and every group member (us too) is in its
--- name list: a group split across machines only shares EQBC. Set once at startup (Init);
+-- name list: a group split across remote machines only shares EQBC. Set once at startup (Init);
 -- the UI radio / set_use_eqbc changes it after that.
 local function eqbc_has_group()
     if not mq.TLO.Plugin('mq2eqbc').IsLoaded() then return false end
@@ -139,6 +139,20 @@ function Core.reachable_names()
     local set = { [def.name:lower()] = true }
     for n in list:gmatch('[^%s|]+') do set[(n:gsub('^.*_', '')):lower()] = true end
     return set
+end
+
+-- The rest of the group, split: boxes (reachable on the transport -- ours, can run sorm)
+-- and outside (an outside player, or a toon off EQBC/DanNet). Mercenaries in neither.
+function Core.group_boxes()
+    local reach, boxes, outside = Core.reachable_names(), {}, {}
+    for i = 1, (mq.TLO.Group.Members() or 0) do
+        local m = mq.TLO.Group.Member(i)
+        local n = m.Name()
+        if n and not m.Mercenary() then
+            if reach[n:lower()] then boxes[#boxes + 1] = n else outside[#outside + 1] = n end
+        end
+    end
+    return boxes, outside
 end
 
 -- The shared task (mission) only: Type 'Shared'. Plain quests read 'Quest'. One of our
@@ -845,10 +859,11 @@ end
 -- nothing, once the MA has ported -- so the group's plugins are paused for the zone-in
 -- and unpaused as each toon lands (start_group_catchup). only = set of names, or all.
 local function start_group_pause(on, only)
+    local reach = Core.reachable_names()   -- an outside player gets nothing
     for i = 1, (mq.TLO.Group.Members() or 0) do
         local m = mq.TLO.Group.Member(i)
         local name, cls = m.Name(), m.Class.ShortName()
-        if name and cls and not m.Mercenary() and (not only or only[name]) then
+        if name and cls and not m.Mercenary() and reach[name:lower()] and (not only or only[name]) then
             bct_mode(name, cls, on and 'pause on' or 'pause off', on and 'pause' or 'unpause', nil, true)
         end
     end
@@ -928,10 +943,11 @@ end
 -- noauto, so the plugins' own auto mode switching leaves them there.
 local function start_group_modes()
     local ma = mq.TLO.Group.MainAssist()
+    local reach = Core.reachable_names()   -- an outside player sets their own
     for i = 0, (mq.TLO.Group.Members() or 0) do
         local m = mq.TLO.Group.Member(i)
         local name, cls = m.Name(), m.Class.ShortName()
-        if name and cls and not m.Mercenary() then
+        if name and cls and not m.Mercenary() and reach[name:lower()] then
             local mode = (name == ma) and 7 or 2   -- 7 SicTank, 2 Chase
             if name == def.name then
                 mq.cmd("/makemevisible")
@@ -1056,10 +1072,16 @@ local function start_group_catchup()
         if not sent or (mq.gettime() - sent) >= START.RESEND_EVERY * 1000 then
             sent = mq.gettime()
             announce_g('Start: %s not in the mission yet -- re-sending ready', table.concat(list, ', '))
-            -- nav first, target once there: a straggler can be well away from the giver
-            for i, name in ipairs(list) do
-                bct_np(name, IF_INGAME.."/nav id %d distance=50 log=off", id)
-                due[name] = sent + 5000 + (i - 1) * 2000   -- 2s apart, not all at once
+            -- nav first, target once there: a straggler can be well away from the giver.
+            -- Only our boxes: an outside player is waited for, not driven.
+            local reach = Core.reachable_names()
+            local i = 0
+            for _, name in ipairs(list) do
+                if reach[name:lower()] then
+                    i = i + 1
+                    bct_np(name, IF_INGAME.."/nav id %d distance=50 log=off", id)
+                    due[name] = sent + 5000 + (i - 1) * 2000   -- 2s apart, not all at once
+                end
             end
         end
         -- Sent from here, not with /timed: the receiver's distance check has to run after
@@ -1137,35 +1159,40 @@ function Core.launch_sorm(names)
     for _, n in ipairs(names) do bct_np(n, IF_INGAME.."/lua run %s", LUA_NAME) end
 end
 local function start_comms_check()
+    local boxes, outside = Core.group_boxes()
+    if #outside > 0 then
+        announce_g('Start: %s not on %s -- not checked, they play themselves', table.concat(outside, ', '),
+            flags.USE_EQBC and 'EQBC' or 'DanNet')
+    end
+    START.pongs = {}   -- kept across rounds: a box that answered is not asked again
     local function silent()
         local out = {}
-        for i = 1, (mq.TLO.Group.Members() or 0) do
-            local m = mq.TLO.Group.Member(i)
-            local n = m.Name()
-            if n and not m.Mercenary() and not START.pongs[n:lower()] then out[#out + 1] = n end
+        for _, n in ipairs(boxes) do
+            if not START.pongs[n:lower()] then out[#out + 1] = n end
         end
         return out
     end
-    local function ping()
-        START.pongs = {}
-        -- the receiver runs it only if its sorm is up: a box without it would print
-        -- "Couldn't parse '/sorm ping'" on every round
-        bcge_np("/if (${Lua.Script[%s].Status.Equal[RUNNING]}) %s ping %s", LUA_NAME, def.cmd, def.name)
+    -- Each still-silent box by name. The receiver runs it only if its sorm is up: a box
+    -- without it would print "Couldn't parse '/sorm ping'" on every round.
+    local function ping(list)
+        for _, n in ipairs(list) do
+            bct_np(n, "/if (${Lua.Script[%s].Status.Equal[RUNNING]}) %s ping %s", LUA_NAME, def.cmd, def.name)
+        end
         mq.delay(START.PING_WAIT * 1000, function() return #silent() == 0 end)
         return silent()
     end
-    local out = ping()
+    local out = ping(boxes)
     if #out == 0 then return true end
     announce_g('Start: no answer from %s -- starting %s there', table.concat(out, ', '), LUA_NAME)
     local launch = Core.launch_sorm
     launch(out)
-    -- re-ping until all answer or LAUNCH_WAIT is up: a fresh script takes a few seconds.
-    -- The /lua run is re-sent to the still-silent every other round: a first one was seen
-    -- to arrive and not start the script (Echo, 2026-11-11). Running it twice is harmless.
+    -- re-ping the silent until all answer or LAUNCH_WAIT is up: a fresh script takes a few
+    -- seconds. The /lua run is re-sent to the still-silent every other round: a first one
+    -- was seen to arrive and not start the script (Echo, 2026-11-11). Twice is harmless.
     local t0, round = mq.gettime(), 0
     repeat
-        mq.delay(2000)
-        out = ping()
+        mq.delay(1000)
+        out = ping(out)
         round = round + 1
         if #out > 0 and round % 2 == 0 then launch(out) end
     until #out == 0 or (mq.gettime() - t0) >= START.LAUNCH_WAIT * 1000
